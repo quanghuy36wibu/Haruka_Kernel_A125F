@@ -36,18 +36,9 @@ jobs:
       - name: Patch KernelSU for this kernel
         run: |
           F=KernelSU-Next/kernel/hook/patch_memory.c
-          echo "--- truoc khi va ---"
-          sed -n 1,35p $F
-          python3 - <<'EOF'
-          import re
-          p = "KernelSU-Next/kernel/hook/patch_memory.c"
-          s = open(p).read()
-          s2 = re.sub(r'[ \t]*#[ \t]*define[ \t]+copy_to_kernel_nofault\([^)]*\)[^\n]*(?:\\\n[^\n]*)*\n', '', s)
-          open(p, "w").write(s2)
-          print("da xoa macro:", s != s2)
-          EOF
+          sed -i '0,/#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)/s//#if 0/' $F
           echo "--- sau khi va ---"
-          sed -n 1,35p $F
+          sed -n 8,20p $F
 
       - name: Stub missing nomount
         run: |
