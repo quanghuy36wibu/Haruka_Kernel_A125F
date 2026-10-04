@@ -29,10 +29,10 @@ jobs:
 
       - name: Stub missing nomount
         run: |
-          if [ ! -f fs/nomount/Kconfig ]; then
-            mkdir -p fs/nomount
-            touch fs/nomount/Kconfig fs/nomount/Makefile
-          fi
+          ls -la fs/nomount || true
+          rm -rf fs/nomount
+          mkdir -p fs/nomount
+          touch fs/nomount/Kconfig fs/nomount/Makefile
           ls -la fs/nomount
 
       - name: Build
