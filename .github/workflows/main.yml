@@ -1,0 +1,50 @@
+name: Build A125F + KernelSU Next
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip curl python3 lld
+
+      - name: Get Neutron clang
+        run: |
+          mkdir -p $HOME/tc && cd $HOME/tc
+          bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
+          echo "$HOME/tc/bin" >> $GITHUB_PATH
+
+      - name: Add KernelSU Next
+        run: |
+          rm -rf KernelSU drivers/kernelsu
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+
+      - name: Build
+        run: |
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          FLAGS="ARCH=arm64 LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
+          mkdir -p out
+          make O=out A125F_defconfig $FLAGS
+          scripts/config --file out/.config \
+            -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS \
+            -e OVERLAY_FS
+          make O=out olddefconfig $FLAGS
+          make O=out -j$(nproc) $FLAGS 2>&1 | tee build.log
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: haruka-a125f-ksunext
+          path: |
+            out/arch/arm64/boot/Image*
+            build.log
