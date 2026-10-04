@@ -3,6 +3,9 @@ name: Build A125F + KernelSU Next
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -22,18 +25,19 @@ jobs:
           bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
           echo "$HOME/tc/bin" >> $GITHUB_PATH
 
-      - name: Add KernelSU Next
+      - name: Add KernelSU Next (legacy)
         run: |
-          rm -rf KernelSU drivers/kernelsu
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash
+          git ls-remote --heads https://github.com/KernelSU-Next/KernelSU-Next | tee heads.txt
+          grep -q "refs/heads/legacy" heads.txt || { echo "Nhanh legacy khong ton tai"; exit 1; }
+          rm -rf KernelSU drivers/kernelsu KernelSU-Next
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          git -C KernelSU-Next branch --show-current || git -C KernelSU-Next log -1 --oneline
 
       - name: Stub missing nomount
         run: |
-          ls -la fs/nomount || true
           rm -rf fs/nomount
           mkdir -p fs/nomount
           touch fs/nomount/Kconfig fs/nomount/Makefile
-          ls -la fs/nomount
 
       - name: Build
         run: |
@@ -49,10 +53,19 @@ jobs:
           make O=out olddefconfig $FLAGS
           make O=out -j$(nproc) $FLAGS 2>&1 | tee build.log
 
-      - name: Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: haruka-a125f-ksunext
           path: |
+            out/arch/arm64/boot/Image*
+            build.log
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ksunext-${{ github.run_number }}
+          name: Haruka A125F + KernelSU Next #${{ github.run_number }}
+          files: |
             out/arch/arm64/boot/Image*
             build.log
