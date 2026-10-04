@@ -1,0 +1,306 @@
+name: Haruka A125F - KernelSU Next
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Kernel variant"
+        required: true
+        type: choice
+        options:
+          - A125F
+          - DroidSpaces
+        default: A125F
+      ksunext_ref:
+        description: "KernelSU-Next ref/commit. legacy is recommended for this 4.19 tree."
+        required: true
+        default: "legacy"
+      build_jobs:
+        description: "Parallel build jobs"
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  KERNEL_DEFCONFIG: A125F_defconfig
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+  AK3_REPO: https://github.com/KernelSU-Next/AnyKernel3.git
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache cpio flex \
+            gcc-aarch64-linux-gnu git libelf-dev libssl-dev \
+            lld clang llvm device-tree-compiler \
+            python3 rsync unzip zip zstd
+
+      - name: Show source information
+        run: |
+          echo "Kernel: $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile | tr '\n' ' ')"
+          echo "Variant: ${{ inputs.variant }}"
+          echo "KSU ref: ${{ inputs.ksunext_ref }}"
+          test -f arch/arm64/configs/A125F_defconfig
+
+      - name: Fetch KernelSU Next
+        run: |
+          rm -rf KernelSU
+          git clone --depth=1 --branch "${{ inputs.ksunext_ref }}" \
+            "${KSU_REPO}" KernelSU || {
+              echo "::error::Unable to clone KernelSU-Next ref '${{ inputs.ksunext_ref }}'"
+              exit 1
+            }
+
+          echo "KernelSU commit:"
+          git -C KernelSU rev-parse HEAD
+          git -C KernelSU describe --tags --always || true
+
+          rm -f drivers/kernelsu
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          test -e drivers/kernelsu/Makefile
+
+      - name: Restore NoMount dependency
+        run: |
+          # The Haruka 4.19.325 source contains fs/nomount as a pointer to
+          # NoMount/kernel/src, but the NoMount repository is not included
+          # in the source archive. Fetch the upstream kernel integration.
+          rm -rf NoMount
+          curl -LSs \
+            https://raw.githubusercontent.com/maxsteeel/nomount/dev/kernel/setup.sh \
+            -o /tmp/nomount-setup.sh
+          chmod +x /tmp/nomount-setup.sh
+          bash /tmp/nomount-setup.sh dev
+
+          test -f fs/nomount/Kconfig
+          test -f fs/nomount/Makefile
+          test -f fs/nomount/nomount.c
+
+          echo "NoMount integration:"
+          grep -E 'CONFIG_NOMOUNT' fs/nomount/Kconfig || true
+          ls -la fs/nomount
+
+      - name: Repair malformed KernelSU gitlink metadata
+        run: |
+          # The Haruka repository contains KernelSU as a gitlink but does not
+          # ship a .gitmodules URL. GitHub Actions' post-checkout cleanup can
+          # otherwise fail with "No url found for submodule path 'KernelSU'".
+          git config -f .gitmodules submodule.KernelSU.path KernelSU
+          git config -f .gitmodules submodule.KernelSU.url \
+            https://github.com/KernelSU-Next/KernelSU-Next.git
+          git config submodule.KernelSU.url \
+            https://github.com/KernelSU-Next/KernelSU-Next.git
+
+      - name: Configure KernelSU Next
+        run: |
+          mkdir -p out
+
+          make O=out "${KERNEL_DEFCONFIG}" \
+            ARCH="${ARCH}" \
+            LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip OBJSIZE=llvm-size \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}"
+
+          if [ "${{ inputs.variant }}" = "DroidSpaces" ]; then
+            make O=out droidspaces_defconfig \
+              ARCH="${ARCH}" \
+              LLVM=1 LLVM_IAS=1 \
+              CC=clang LD=ld.lld \
+              AR=llvm-ar NM=llvm-nm \
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+              STRIP=llvm-strip OBJSIZE=llvm-size \
+              CROSS_COMPILE="${CROSS_COMPILE}" \
+              CLANG_TRIPLE="${CLANG_TRIPLE}"
+          fi
+
+          # 4.19 is a non-GKI kernel, so KSU must be built into vmlinux.
+          ./scripts/config --file out/.config --enable CONFIG_KSU || true
+
+          # Prefer manual hooks on old/non-GKI kernels when the selected KSU
+          # tree exposes this symbol.
+          ./scripts/config --file out/.config \
+            --enable CONFIG_KSU_MANUAL_HOOK \
+            --disable CONFIG_KSU_KPROBES_HOOK \
+            --disable CONFIG_KSU_TRACEPOINT_HOOK || true
+
+          make O=out olddefconfig \
+            ARCH="${ARCH}" \
+            LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip OBJSIZE=llvm-size \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}"
+
+          echo "===== Effective KSU config ====="
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+
+      - name: Validate final configuration
+        run: |
+          grep -q '^CONFIG_KSU=y' out/.config
+          if grep -q 'config NOMOUNT' fs/nomount/Kconfig; then
+            grep -q '^CONFIG_NOMOUNT=y' out/.config
+          fi
+          echo "KSU and NoMount configuration validated."
+
+      - name: Build kernel
+        env:
+          JOBS: ${{ inputs.build_jobs }}
+          KCFLAGS: "-O3 -mcpu=cortex-a53+crypto+crc -ffp-contract=fast -mllvm -enable-epilogue-vectorization -mllvm -polly"
+        run: |
+          make -j"${JOBS}" O=out \
+            ARCH="${ARCH}" \
+            LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip OBJSIZE=llvm-size \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            KCFLAGS="${KCFLAGS}"
+
+          test -s out/arch/arm64/boot/Image.gz
+          test -s out/arch/arm64/boot/dts/mediatek/mt6765.dtb
+
+          # The A125F tree builds Image.gz and the MT6765 DTB separately.
+          # Produce the conventional Image.gz-dtb kernel artifact.
+          cat \
+            out/arch/arm64/boot/Image.gz \
+            out/arch/arm64/boot/dts/mediatek/mt6765.dtb \
+            > out/arch/arm64/boot/Image.gz-dtb
+
+          test -s out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Fetch AnyKernel3
+        run: |
+          rm -rf AnyKernel3
+          git clone --depth=1 "${AK3_REPO}" AnyKernel3
+          rm -rf AnyKernel3/.git
+
+      - name: Prepare AnyKernel3
+        run: |
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
+
+          # Keep the upstream AnyKernel3 flashing engine intact. Only replace
+          # its kernel string/device metadata when those keys are present.
+          if grep -q '^kernel.string=' AnyKernel3/anykernel.sh; then
+            sed -i 's/^kernel.string=.*/kernel.string=Haruka Kernel A125F + KernelSU Next/' AnyKernel3/anykernel.sh
+          fi
+
+          # Remove the generic prebuilt kernel so only this build is packaged.
+          find AnyKernel3 -maxdepth 1 -type f \
+            \( -name 'Image*' -o -name 'zImage*' -o -name 'dtb' -o -name 'dt.img' \) \
+            -delete
+
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
+
+          # Show the important package contents.
+          find AnyKernel3 -maxdepth 2 -type f | sort | head -100
+
+      - name: Build AnyKernel3 flashable ZIP
+        run: |
+          mkdir -p artifacts
+
+          (
+            cd AnyKernel3
+            zip -r9 "../artifacts/Haruka-A125F-KSUNext-${{ inputs.variant }}-AnyKernel3.zip" . \
+              -x '*.git*' -x 'README.md'
+          )
+
+          test -s "artifacts/Haruka-A125F-KSUNext-${{ inputs.variant }}-AnyKernel3.zip"
+
+      - name: Repack boot.img from repository base image
+        id: repack
+        run: |
+          # Put your known-good stock boot image at:
+          #   base/boot.img
+          #
+          # This is required because the kernel alone does not contain the
+          # original Samsung ramdisk/header needed to make a boot image.
+          if [ ! -s base/boot.img ]; then
+            echo "No base/boot.img found; skipping boot.img generation."
+            echo "Add your exact stock boot.img to base/boot.img and rerun."
+            echo "BOOT_IMAGE_BUILT=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          MAGISKBOOT=""
+          for p in \
+            AnyKernel3/tools/magiskboot \
+            AnyKernel3/tools/arm64/magiskboot \
+            AnyKernel3/tools/arm/magiskboot \
+            AnyKernel3/tools/x86_64/magiskboot; do
+            if [ -x "$p" ]; then
+              MAGISKBOOT="$p"
+              break
+            fi
+          done
+
+          if [ -z "$MAGISKBOOT" ]; then
+            echo "::error::magiskboot was not found in AnyKernel3."
+            exit 1
+          fi
+
+          cp base/boot.img work-boot.img
+          chmod +x "$MAGISKBOOT"
+
+          rm -rf boot-unpack
+          mkdir boot-unpack
+          cd boot-unpack
+
+          "$GITHUB_WORKSPACE/$MAGISKBOOT" unpack "$GITHUB_WORKSPACE/work-boot.img"
+
+          # magiskboot normally extracts kernel as 'kernel'.
+          test -s kernel
+
+          # Preserve the original boot header/ramdisk and replace only kernel.
+          cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/Image.gz-dtb" kernel
+
+          "$GITHUB_WORKSPACE/$MAGISKBOOT" repack "$GITHUB_WORKSPACE/work-boot.img"
+
+          test -s new-boot.img
+          cp new-boot.img \
+            "$GITHUB_WORKSPACE/artifacts/Haruka-A125F-KSUNext-${{ inputs.variant }}-boot.img"
+
+          cd "$GITHUB_WORKSPACE"
+          echo "BOOT_IMAGE_BUILT=true" >> "$GITHUB_ENV"
+
+      - name: Write build manifest
+        run: |
+          {
+            echo "device=SM-A125F"
+            echo "kernel=4.19.325"
+            echo "variant=${{ inputs.variant }}"
+            echo "ksunext_ref=${{ inputs.ksunext_ref }}"
+            echo "ksunext_commit=$(git -C KernelSU rev-parse HEAD)"
+            echo "kernel_commit=$(git rev-parse HEAD 2>/dev/null || echo archive)"
+            echo "ksu_config=$(grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config | tr '\n' ';')"
+            echo "boot_image_built=${BOOT_IMAGE_BUILT:-false}"
+          } > artifacts/build-manifest.txt
+
+          sha256sum artifacts/* > artifacts/SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haruka-A125F-KSUNext-${{ inputs.variant }}
+          if-no-files-found: error
+          path: artifacts/
+          retention-days: 14
