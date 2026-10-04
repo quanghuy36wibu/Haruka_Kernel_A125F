@@ -31,7 +31,23 @@ jobs:
           grep -q "refs/heads/legacy" heads.txt || { echo "Nhanh legacy khong ton tai"; exit 1; }
           rm -rf KernelSU drivers/kernelsu KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          git -C KernelSU-Next branch --show-current || git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next branch --show-current
+
+      - name: Patch KernelSU for this kernel
+        run: |
+          F=KernelSU-Next/kernel/hook/patch_memory.c
+          echo "--- truoc khi va ---"
+          sed -n 1,35p $F
+          python3 - <<'EOF'
+          import re
+          p = "KernelSU-Next/kernel/hook/patch_memory.c"
+          s = open(p).read()
+          s2 = re.sub(r'[ \t]*#[ \t]*define[ \t]+copy_to_kernel_nofault\([^)]*\)[^\n]*(?:\\\n[^\n]*)*\n', '', s)
+          open(p, "w").write(s2)
+          print("da xoa macro:", s != s2)
+          EOF
+          echo "--- sau khi va ---"
+          sed -n 1,35p $F
 
       - name: Stub missing nomount
         run: |
