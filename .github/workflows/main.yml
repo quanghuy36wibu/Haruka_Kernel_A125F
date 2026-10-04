@@ -2,6 +2,11 @@ name: Build A125F + KernelSU Next
 
 on:
   workflow_dispatch:
+    inputs:
+      overclock:
+        description: "Ep xung 2.5GHz (cpu0-3) / 2.0GHz (cpu4-7)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -37,8 +42,123 @@ jobs:
         run: |
           F=KernelSU-Next/kernel/hook/patch_memory.c
           sed -i '0,/#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)/s//#if 0/' $F
-          echo "--- sau khi va ---"
           sed -n 8,20p $F
+
+      - name: Fix missing init_rc hook symbol
+        run: |
+          echo "=== hook KSU co san trong kernel ==="
+          grep -rn "ksu_" fs kernel include security --include=*.c --include=*.h | grep -v "^KernelSU" | head -60 || true
+          echo "=== init_rc trong KernelSU ==="
+          grep -rn "init_rc\|ksu_handle_sys_read" KernelSU-Next/kernel | head -30 || true
+          T=KernelSU-Next/kernel/supercall/supercall.c
+          if grep -rqE "ksu_is_init_rc_hook_enabled[[:space:]]*\(" KernelSU-Next/kernel --include=*.c; then
+            echo "KSU da co ham nay, khong them"
+          else
+            echo "" >> $T
+            echo "/* compat shim */" >> $T
+            echo "#include <linux/types.h>" >> $T
+            if grep -rqE "bool[[:space:]]+ksu_init_rc_hook" KernelSU-Next/kernel; then
+              echo "extern bool ksu_init_rc_hook;" >> $T
+              echo "bool ksu_is_init_rc_hook_enabled(void) { return ksu_init_rc_hook; }" >> $T
+              echo "Dung bien ksu_init_rc_hook"
+            elif grep -rqE "ksu_handle_sys_read[[:space:]]*\(" KernelSU-Next/kernel --include=*.c; then
+              echo "bool ksu_is_init_rc_hook_enabled(void) { return true; }" >> $T
+              echo "Tra ve true"
+            else
+              echo "bool ksu_is_init_rc_hook_enabled(void) { return false; }" >> $T
+              echo "Tra ve false"
+            fi
+          fi
+          tail -8 $T
+
+      - name: Overclock (DTS)
+        if: ${{ inputs.overclock }}
+        run: |
+          python3 - <<'EOF'
+          import re, sys, subprocess
+
+          NEW = {"opp_table0": (2500000000, 1281250),
+                 "opp_table1": (2000000000, 1237500)}
+          CPUF = {"0": 2500000000, "1": 2000000000}
+          TOK = r'0[xX][0-9a-fA-F]+|\d+'
+
+          def match_brace(s, i):
+              d = 0
+              for j in range(i, len(s)):
+                  if s[j] == '{': d += 1
+                  elif s[j] == '}':
+                      d -= 1
+                      if d == 0: return j
+              return -1
+
+          def val(inner):
+              t = [int(x, 0) for x in re.findall(TOK, inner)]
+              return ((t[0] << 32) | t[1]) if len(t) == 2 else t[0]
+
+          def fmt(inner, v):
+              t = re.findall(TOK, inner)
+              if len(t) == 2: return "0x%x 0x%x" % (v >> 32, v & 0xffffffff)
+              if len(t) > 2: return " ".join(str(v) for _ in t)
+              if t and t[0].lower().startswith("0x"): return "0x%x" % v
+              return str(v)
+
+          def setprop(block, prop, v):
+              rx = re.compile('(' + prop + r'\s*=\s*(?:/bits/\s*64\s*)?<)([^>]*)(>)')
+              m = rx.search(block)
+              if not m: return block, False
+              return block[:m.start(2)] + fmt(m.group(2), v) + block[m.end(2):], True
+
+          def patch_table(text, tname, log):
+              m = re.search(r'\b' + tname + r'\s*\{', text)
+              if not m: return text, 0
+              b = m.end() - 1
+              e = match_brace(text, b)
+              tbl = text[b:e + 1]
+              best = None
+              for om in re.finditer(r'\bopp\d+\s*\{', tbl):
+                  ob = om.end() - 1
+                  oe = match_brace(tbl, ob)
+                  mm = re.search(r'opp-hz\s*=\s*(?:/bits/\s*64\s*)?<([^>]*)>', tbl[ob:oe + 1])
+                  if mm:
+                      h = val(mm.group(1))
+                      if best is None or h > best[0]: best = (h, ob, oe)
+              if not best: return text, 0
+              h, ob, oe = best
+              hz, uv = NEW[tname]
+              blk = tbl[ob:oe + 1]
+              blk, ok1 = setprop(blk, 'opp-hz', hz)
+              blk, ok2 = setprop(blk, 'opp-microvolt', uv)
+              log.append("%s: bac cao nhat %d MHz -> %d MHz, %d mV" % (tname, h // 1000000, hz // 1000000, uv // 1000))
+              tbl = tbl[:ob] + blk + tbl[oe + 1:]
+              return text[:b] + tbl + text[e + 1:], 1
+
+          files = subprocess.check_output("grep -rl opp_table0 arch/arm64/boot/dts || true", shell=True, text=True).split()
+          print("Files:", files)
+          done = {"opp_table0": 0, "opp_table1": 0}
+          cpu_done = 0
+          for f in files:
+              s = open(f).read()
+              o = s
+              log = []
+              for t in ("opp_table0", "opp_table1"):
+                  s, n = patch_table(s, t, log)
+                  done[t] += n
+              for m in reversed(list(re.finditer(r'cpu@([01])0[0-3]\s*\{', s))):
+                  b = m.end() - 1
+                  e = match_brace(s, b)
+                  blk, ok = setprop(s[b:e + 1], 'clock-frequency', CPUF[m.group(1)])
+                  if ok:
+                      s = s[:b] + blk + s[e + 1:]
+                      cpu_done += 1
+              if s != o:
+                  open(f, "w").write(s)
+                  print("Da sua", f)
+                  for l in log: print("  ", l)
+          print("Ket qua:", done, "cpu:", cpu_done)
+          if done["opp_table0"] == 0 or done["opp_table1"] == 0:
+              sys.exit("KHONG tim thay opp_table0/opp_table1 trong dts - dung lai")
+          EOF
+          git diff --stat -- arch/arm64/boot/dts | tail -5
 
       - name: Stub missing nomount
         run: |
@@ -61,14 +181,17 @@ jobs:
           make O=out -j$(nproc) $FLAGS 2>&1 | tee build.log
 
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: haruka-a125f-ksunext
           path: |
             out/arch/arm64/boot/Image*
+            out/arch/arm64/boot/dts/mediatek/*.dtb
             build.log
 
       - name: Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ksunext-${{ github.run_number }}
