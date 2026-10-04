@@ -1,243 +1,506 @@
-name: Haruka A125F • KernelSU Next • AnyKernel3
+name: Build A125F + KernelSU Next + AnyKernel3
 
 on:
   workflow_dispatch:
     inputs:
-      variant:
-        description: "Kernel config"
-        required: true
-        type: choice
-        default: A125F
-        options:
-          - A125F
-          - DroidSpaces
-      ksu_ref:
-        description: "KernelSU-Next ref (legacy is recommended for this 4.19 tree)"
-        required: true
-        default: legacy
-      make_boot:
-        description: "Build boot.img from a stock boot image"
-        required: true
+      overclock:
+        description: "OC 2.5GHz CPU0-3 / 2.0GHz CPU4-7"
         type: boolean
-        default: false
-      stock_boot_url:
-        description: "Direct URL to a STOCK boot.img matching the target firmware (leave empty if not making boot.img)"
-        required: false
-        default: ""
+        default: true
+      ksu_ref:
+        description: "KernelSU-Next branch/ref"
+        type: string
+        default: "legacy"
+      make_jobs:
+        description: "Build jobs"
+        type: string
+        default: "4"
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   ARCH: arm64
-  CROSS_COMPILE: aarch64-linux-gnu-
   CLANG_TRIPLE: aarch64-linux-gnu-
-  KCFLAGS: "-O3 -mcpu=cortex-a53+crypto+crc -ffp-contract=fast -mllvm -enable-epilogue-vectorization -mllvm -polly"
-  KSU_SETUP: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-  AK3_REPO: "https://github.com/osm0sis/AnyKernel3.git"
+  CROSS_COMPILE: aarch64-linux-gnu-
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+  AK3_REPO: https://github.com/KernelSU-Next/AnyKernel3.git
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
 
     steps:
-      - name: Checkout Haruka kernel
+      - name: Checkout kernel
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio flex \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libelf-dev libssl-dev rsync \
-            clang lld llvm python3 unzip zip xz-utils zstd \
-            device-tree-compiler curl git
+            bc bison flex build-essential libssl-dev libelf-dev \
+            cpio zip unzip curl wget python3 git lld clang llvm \
+            gcc-aarch64-linux-gnu device-tree-compiler rsync
 
-      - name: Show source information
+      - name: Get Neutron clang
         run: |
-          echo "Kernel: $(make -s kernelversion 2>/dev/null || true)"
-          echo "Defconfigs:"
-          ls -l arch/arm64/configs/A125F_defconfig arch/arm64/configs/droidspaces_defconfig
+          mkdir -p "$HOME/tc"
+          cd "$HOME/tc"
+          bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
+          echo "$HOME/tc/bin" >> "$GITHUB_PATH"
+          echo "clang:"
+          "$HOME/tc/bin/clang" --version || true
 
-      # KernelSU-Next's official setup script supports selecting the legacy tree
-      # with: setup.sh legacy. The Haruka source already contains the manual
-      # hook call-sites used by its KSU/SUSFS integration.
-      - name: Integrate KernelSU-Next
-        env:
-          KSU_REF: ${{ inputs.ksu_ref }}
+      # The supplied Haruka archive contains fs/nomount as a symlink/text
+      # reference to NoMount. The ZIP does not contain the external tree.
+      - name: Prepare NoMount
         run: |
-          rm -rf KernelSU KernelSU-Next
-          curl -LSs "$KSU_SETUP" -o /tmp/ksu-setup.sh
-          chmod +x /tmp/ksu-setup.sh
-          bash /tmp/ksu-setup.sh "$KSU_REF"
+          if [ -e fs/nomount/Kconfig ]; then
+            echo "NoMount is already present."
+            exit 0
+          fi
 
-          test -e drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
+          rm -rf fs/nomount
+          mkdir -p fs/nomount
+
+          # First try to obtain the actual NoMount tree.
+          git clone --depth=1 https://github.com/maxsteeel/nomount.git /tmp/nomount
+
+          if [ -f /tmp/nomount/kernel/src/Kconfig ]; then
+            cp -a /tmp/nomount/kernel/src/. fs/nomount/
+          elif [ -f /tmp/nomount/kernel/src/Makefile ]; then
+            cp -a /tmp/nomount/kernel/src/. fs/nomount/
+          else
+            echo "::warning::NoMount kernel source was not found in expected path."
+            echo "Using a minimal Kconfig/Makefile fallback so the Haruka tree can configure."
+            printf '%s\n' 'menu "NoMount"' 'endmenu' > fs/nomount/Kconfig
+            : > fs/nomount/Makefile
+          fi
+
+          test -f fs/nomount/Kconfig
+
+      - name: Add KernelSU Next legacy
+        run: |
+          git ls-remote --heads "$KSU_REPO" | tee ksu-heads.txt
+          grep -q "refs/heads/legacy" ksu-heads.txt || {
+            echo "::error::KernelSU-Next legacy branch is unavailable"
+            exit 1
+          }
+
+          rm -rf KernelSU KernelSU-Next drivers/kernelsu
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s legacy
+
+          if [ -d KernelSU-Next ]; then
+            KSU_TREE=KernelSU-Next
+          elif [ -d KernelSU ]; then
+            KSU_TREE=KernelSU
+          else
+            echo "::error::KernelSU-Next setup did not create a kernel tree"
+            exit 1
+          fi
+
+          echo "KSU_TREE=$KSU_TREE" >> "$GITHUB_ENV"
+
+          rm -f drivers/kernelsu
+          ln -s "../${KSU_TREE}/kernel" drivers/kernelsu
+
           test -f drivers/kernelsu/Makefile
-          echo "KernelSU-Next integration:"
-          readlink -f drivers/kernelsu
+          echo "KernelSU commit:"
+          git -C "$KSU_TREE" rev-parse HEAD
 
-      - name: Configure kernel
+      - name: Patch KernelSU for Linux 4.19
         run: |
+          F="$KSU_TREE/kernel/hook/patch_memory.c"
+
+          if grep -q '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)' "$F"; then
+            sed -i \
+              '0,/#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)/s//#if 0/' "$F"
+          fi
+
+          python3 - <<'PY'
+          import re
+          import os
+
+          p = os.environ["KSU_TREE"] + "/kernel/runtime/ksud_integration.c"
+          s = open(p, encoding="utf-8").read()
+
+          if "ksu_is_init_rc_hook_enabled" not in s:
+              anchor = "bool ksu_init_rc_hook __read_mostly = true;"
+              if anchor in s:
+                  s = s.replace(
+                      anchor,
+                      "#include <linux/jump_label.h>\n"
+                      "DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);\n"
+                      + anchor, 1
+                  )
+
+                  inserted = 0
+
+                  m = re.search(
+                      r'static void do_stop_init_rc_hook\([^)]*\)\s*\{',
+                      s
+                  )
+                  if m:
+                      s = (
+                          s[:m.end()]
+                          + "\n\tstatic_branch_disable(&ksu_is_init_rc_hook_enabled);"
+                          + s[m.end():]
+                      )
+                      inserted += 1
+
+                  m = re.search(r'void stop_init_rc_hook\(\)\s*\{', s)
+                  if m:
+                      j = s.find("ksu_init_rc_hook = false;", m.end())
+                      if j >= 0:
+                          k = j + len("ksu_init_rc_hook = false;")
+                          s = (
+                              s[:k]
+                              + "\n\tstatic_branch_disable(&ksu_is_init_rc_hook_enabled);"
+                              + s[k:]
+                          )
+                          inserted += 1
+
+                  if inserted == 0:
+                      print("warning: no stop hook insertion point found")
+              else:
+                  print("warning: KSU init rc anchor not found")
+
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+
+          grep -R "ksu_is_init_rc_hook_enabled" \
+            "$KSU_TREE/kernel/runtime/ksud_integration.c" || true
+
+      - name: Configure A125F
+        run: |
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          FLAGS="ARCH=$ARCH LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
+
           rm -rf out
           mkdir -p out
 
-          if [ "${{ inputs.variant }}" = "DroidSpaces" ]; then
-            make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
-              CC=clang LD=ld.lld \
-              CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
-              A125F_defconfig droidspaces_defconfig
-          else
-            make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
-              CC=clang LD=ld.lld \
-              CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
-              A125F_defconfig
-          fi
+          make O=out A125F_defconfig $FLAGS
 
-          # Haruka's source already has the KSU call-sites. Enable the
-          # corresponding manual-hook mode and keep the other hook backends off.
+          # Keep the Haruka config and explicitly require KSU.
           scripts/config --file out/.config \
             --enable CONFIG_KSU \
+            --enable CONFIG_KPROBES \
+            --enable CONFIG_HAVE_KPROBES \
+            --enable CONFIG_KPROBE_EVENTS \
+            --enable CONFIG_OVERLAY_FS || true
+
+          # Manual hook is preferred when exposed by this KSU tree.
+          scripts/config --file out/.config \
             --enable CONFIG_KSU_MANUAL_HOOK \
             --disable CONFIG_KSU_KPROBES_HOOK \
-            --disable CONFIG_KSU_TRACEPOINT_HOOK
+            --disable CONFIG_KSU_TRACEPOINT_HOOK || true
 
-          make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
-            CC=clang LD=ld.lld \
-            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
-            olddefconfig
+          make O=out olddefconfig $FLAGS
 
-          echo "---- KSU config ----"
+          echo "===== KSU CONFIG ====="
           grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
 
       - name: Build kernel
         run: |
-          make -j"$(nproc)" O=out ARCH="$ARCH" \
-            LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld \
-            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
-            KCFLAGS="$KCFLAGS"
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
 
-          echo "---- boot outputs ----"
-          find out/arch/arm64/boot -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+          FLAGS="ARCH=$ARCH LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
 
-          test -s out/arch/arm64/boot/Image.lz4
+          make O=out -j"${{ inputs.make_jobs }}" $FLAGS 2>&1 | tee build.log
 
-      - name: Prepare AnyKernel3
+          test -s out/arch/arm64/boot/Image
+
+          if [ -s out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz Image.gz
+          else
+            gzip -9 -c out/arch/arm64/boot/Image > Image.gz
+          fi
+
+      - name: Apply optional overclock to DTB
+        if: ${{ inputs.overclock }}
+        run: |
+          python3 - <<'PY'
+          import struct
+          import shutil
+          import sys
+
+          src = "out/arch/arm64/boot/dts/mediatek/mt6765.dtb"
+
+          if not __import__("os").path.exists(src):
+              print("DTB not found:", src)
+              sys.exit(1)
+
+          stock = src.replace(".dtb", ".stock.dtb")
+          shutil.copy2(src, stock)
+
+          d = bytearray(open(src, "rb").read())
+
+          if len(d) < 40:
+              sys.exit("Invalid DTB")
+
+          magic, total, off_struct, off_str, off_rsv, ver, lc, bc, \
+              sz_str, sz_struct = struct.unpack(">10I", d[:40])
+
+          if magic != 0xD00DFEED:
+              sys.exit("Invalid DTB magic")
+
+          strs = bytes(d[off_str:off_str + sz_str])
+
+          def nm(o):
+              end = strs.index(b"\0", o)
+              return strs[o:end].decode()
+
+          i = off_struct
+          path = []
+          props = {}
+
+          while i < off_struct + sz_struct:
+              t = struct.unpack(">I", d[i:i+4])[0]
+              i += 4
+
+              if t == 1:  # BEGIN_NODE
+                  end = d.index(0, i)
+                  name = bytes(d[i:end]).decode()
+                  i = (end + 4) & ~3
+                  path.append(name)
+
+              elif t == 2:  # END_NODE
+                  if path:
+                      path.pop()
+
+              elif t == 3:  # PROP
+                  ln, no = struct.unpack(">II", d[i:i+8])
+                  i += 8
+                  props[("/".join(path), nm(no))] = (i, ln)
+                  i = (i + ln + 3) & ~3
+
+              elif t == 4:  # NOP
+                  pass
+
+              elif t == 9:  # END
+                  break
+
+              else:
+                  break
+
+          plan = (
+              ("opp_table0", 2500000000, 1281250),
+              ("opp_table1", 2000000000, 1237500),
+          )
+
+          for table, hz, uv in plan:
+              candidates = []
+
+              for (p, n), (o, l) in props.items():
+                  if (
+                      p.startswith("/" + table + "/")
+                      and n == "opp-hz"
+                      and l == 8
+                  ):
+                      old_hz = struct.unpack(">Q", d[o:o+8])[0]
+                      candidates.append((old_hz, p))
+
+              if not candidates:
+                  print("WARNING: no", table, "opp-hz; skipping")
+                  continue
+
+              old_hz, p = max(candidates)
+
+              o, l = props[(p, "opp-hz")]
+              d[o:o+8] = struct.pack(">Q", hz)
+
+              if (p, "opp-microvolt") in props:
+                  o, l = props[(p, "opp-microvolt")]
+                  old_uv = (
+                      struct.unpack(">I", d[o:o+4])[0]
+                      if l >= 4 else 0
+                  )
+                  for k in range(l // 4):
+                      d[o+4*k:o+4*k+4] = struct.pack(">I", uv)
+
+                  print(
+                      table, p,
+                      old_hz // 1000000, "MHz",
+                      old_uv // 1000, "mV ->",
+                      hz // 1000000, "MHz",
+                      uv // 1000, "mV"
+                  )
+
+          open(src, "wb").write(d)
+          print("Overclock DTB complete")
+          PY
+
+      - name: Build Image.gz-dtb
+        run: |
+          DTB="out/arch/arm64/boot/dts/mediatek/mt6765.dtb"
+
+          test -s "$DTB"
+
+          cat Image.gz "$DTB" > Image.gz-dtb
+
+          mkdir -p artifacts
+          cp out/arch/arm64/boot/Image artifacts/Image
+          cp Image.gz artifacts/Image.gz
+          cp Image.gz-dtb artifacts/Image.gz-dtb
+          cp "$DTB" artifacts/mt6765.dtb
+
+          if [ -f out/arch/arm64/boot/dts/mediatek/mt6765.stock.dtb ]; then
+            cp out/arch/arm64/boot/dts/mediatek/mt6765.stock.dtb \
+              artifacts/mt6765.stock.dtb
+          fi
+
+      - name: Clone AnyKernel3
         run: |
           rm -rf AnyKernel3
           git clone --depth=1 "$AK3_REPO" AnyKernel3
+          rm -rf AnyKernel3/.git
 
-          # A125F is a non-A/B Samsung MT6765 device; use the boot partition
-          # by name and let AK3 preserve the original ramdisk/DTB when needed.
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("AnyKernel3/anykernel.sh")
-          s = p.read_text()
-          s = s.replace(
-              "device.name1=maguro",
-              "device.name1=a12"
-          )
-          s = s.replace(
-              "kernel.string=ExampleKernel by osm0sis @ xda-developers",
-              "kernel.string=Haruka A125F KernelSU Next"
-          )
-          s = s.replace(
-              "BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;",
-              "BLOCK=/dev/block/bootdevice/by-name/boot;"
-          )
-          s = s.replace(
-              "block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;",
-              "block=/dev/block/bootdevice/by-name/boot;"
-          )
-          s = s.replace("is_slot_device=1;", "is_slot_device=0;")
-          s = s.replace("IS_SLOT_DEVICE=1;", "IS_SLOT_DEVICE=0;")
-          # Broad compatibility with Samsung recovery environments.
-          s = s.replace("do.devicecheck=1", "do.devicecheck=1")
-          p.write_text(s)
-          PY
-
-          cp out/arch/arm64/boot/Image.lz4 AnyKernel3/
-
-          # Keep a DTB/DTBO only if the kernel build actually generated one.
-          # Otherwise AK3 retains the original image's corresponding component.
-          if [ -s out/arch/arm64/boot/dtbo.img ]; then
-            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-          fi
-          if [ -s out/arch/arm64/boot/dtb.img ]; then
-            cp out/arch/arm64/boot/dtb.img AnyKernel3/
-          fi
-
-          rm -rf AnyKernel3/.git AnyKernel3/.github
-          rm -f AnyKernel3/README.md
-
-          (cd AnyKernel3 && zip -r9 ../Haruka-A125F-KSUNext-AnyKernel3.zip . \
-            -x '*.git*' -x '*.DS_Store')
-
-          test -s Haruka-A125F-KSUNext-AnyKernel3.zip
-
-      - name: Build boot.img from stock boot
-        if: ${{ inputs.make_boot && inputs.stock_boot_url != '' }}
+      - name: Prepare AnyKernel3
         run: |
-          mkdir -p bootwork
-          curl -L --fail --retry 3 \
-            "${{ inputs.stock_boot_url }}" \
-            -o bootwork/boot.img
+          cp Image.gz-dtb AnyKernel3/Image.gz-dtb
+          cp artifacts/mt6765.dtb AnyKernel3/mt6765.dtb
 
-          test -s bootwork/boot.img
+          # Use a simple A125F package configuration. AnyKernel3 retains
+          # the existing ramdisk/header when flashing its kernel payload.
+          cat > AnyKernel3/anykernel.sh <<'AK3'
+          properties() { '
+          kernel.string=Haruka A125F + KernelSU Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a12
+          device.name2=a125f
+          device.name3=SM-A125F
+          '; }
 
-          # AnyKernel3 ships magiskboot and understands modern Android boot
-          # formats; for MTK it also contains mkmtkhdr support.
-          cp AnyKernel3/tools/magiskboot bootwork/
-          chmod +x bootwork/magiskboot
+          block=auto;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          AK3
+
+          # Remove example payloads that could interfere.
+          find AnyKernel3 -maxdepth 1 -type f \
+            \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' \) \
+            ! -name 'Image.gz-dtb' -delete || true
+
+      - name: Package AnyKernel3
+        run: |
+          cd AnyKernel3
+          zip -r9 "../artifacts/Haruka-A125F-KSUNext-AnyKernel3.zip" . \
+            -x '*.git*' -x 'README.md'
+
+          cd ..
+          test -s artifacts/Haruka-A125F-KSUNext-AnyKernel3.zip
+
+      # Optional exact-firmware boot repack.
+      # Put your own matching stock boot image at base/boot.img.
+      - name: Repack boot.img
+        id: boot
+        run: |
+          if [ ! -s base/boot.img ]; then
+            echo "No base/boot.img; skipping boot repack."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MAGISKBOOT=""
+
+          for p in \
+            AnyKernel3/tools/magiskboot \
+            AnyKernel3/tools/arm64/magiskboot \
+            AnyKernel3/tools/arm/magiskboot \
+            AnyKernel3/tools/x86_64/magiskboot; do
+            if [ -x "$p" ]; then
+              MAGISKBOOT="$p"
+              break
+            fi
+          done
+
+          if [ -z "$MAGISKBOOT" ]; then
+            echo "::error::AnyKernel3 does not contain magiskboot"
+            exit 1
+          fi
+
+          chmod +x "$MAGISKBOOT"
+
+          rm -rf bootwork
+          mkdir bootwork
+          cp base/boot.img bootwork/boot.img
 
           cd bootwork
-          ./magiskboot unpack boot.img
+          "$GITHUB_WORKSPACE/$MAGISKBOOT" unpack boot.img
 
-          echo "---- stock boot components ----"
-          ls -lah
+          # magiskboot extracts the kernel to ./kernel.
+          test -s kernel
 
-          # Haruka's defconfig selects CONFIG_KERNEL_LZ4=y, so the kernel
-          # artifact is Image.lz4.
-          test -s ../out/arch/arm64/boot/Image.lz4
-          cp ../out/arch/arm64/boot/Image.lz4 kernel
+          cp "$GITHUB_WORKSPACE/Image.gz-dtb" kernel
 
-          ./magiskboot repack boot.img
+          "$GITHUB_WORKSPACE/$MAGISKBOOT" repack boot.img
+
           test -s new-boot.img
 
-          mv new-boot.img ../Haruka-A125F-KSUNext-boot.img
-          cd ..
+          cp new-boot.img \
+            "$GITHUB_WORKSPACE/artifacts/Haruka-A125F-KSUNext-boot.img"
 
-      - name: Upload kernel + AnyKernel3
-        uses: actions/upload-artifact@v4
-        with:
-          name: Haruka-A125F-KSUNext-${{ inputs.variant }}
-          if-no-files-found: error
-          path: |
-            out/arch/arm64/boot/Image.lz4
-            out/.config
-            Haruka-A125F-KSUNext-AnyKernel3.zip
+          cd "$GITHUB_WORKSPACE"
+          echo "built=true" >> "$GITHUB_OUTPUT"
 
-      - name: Upload boot image
-        if: ${{ inputs.make_boot && inputs.stock_boot_url != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: Haruka-A125F-KSUNext-boot-${{ inputs.variant }}
-          if-no-files-found: error
-          path: Haruka-A125F-KSUNext-boot.img
-
-      - name: Create checksums
+      - name: Create manifest
         run: |
-          sha256sum \
-            out/arch/arm64/boot/Image.lz4 \
-            Haruka-A125F-KSUNext-AnyKernel3.zip \
-            ${BOOT_ARTIFACT:-/dev/null} 2>/dev/null | tee SHA256SUMS.txt || true
+          {
+            echo "device=SM-A125F"
+            echo "kernel=4.19.325"
+            echo "ksu_ref=${{ inputs.ksu_ref }}"
+            echo "ksu_commit=$(git -C "$KSU_TREE" rev-parse HEAD)"
+            echo "overclock=${{ inputs.overclock }}"
+            echo "boot_repacked=${{ steps.boot.outputs.built }}"
+            echo "kernel_commit=$(git rev-parse HEAD 2>/dev/null || true)"
+            echo
+            echo "[KSU CONFIG]"
+            grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+          } > artifacts/build-manifest.txt
 
-      - name: Upload checksums
+          cp build.log artifacts/build.log
+          sha256sum artifacts/* > artifacts/SHA256SUMS
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Haruka-A125F-KSUNext-SHA256
-          path: SHA256SUMS.txt
+          name: Haruka-A125F-KSUNext
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ksunext-${{ github.run_number }}
+          name: Haruka A125F + KernelSU Next #${{ github.run_number }}
+          generate_release_notes: true
+          files: |
+            artifacts/Haruka-A125F-KSUNext-AnyKernel3.zip
+            artifacts/Haruka-A125F-KSUNext-boot.img
+            artifacts/Image.gz
+            artifacts/Image.gz-dtb
+            artifacts/mt6765.dtb
+            artifacts/mt6765.stock.dtb
+            artifacts/build.log
+            artifacts/build-manifest.txt
+            artifacts/SHA256SUMS
