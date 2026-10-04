@@ -38,6 +38,26 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
           git -C KernelSU-Next branch --show-current
 
+      - name: Add SuSFS
+        run: |
+          git clone --depth=1 -b kernel-4.19 \
+            https://github.com/simonpunk/susfs4ksu susfs4ksu || \
+          git clone --depth=1 \
+            https://github.com/simonpunk/susfs4ksu susfs4ksu
+
+          # Patch kernel source
+          patch -p1 --forward \
+            < susfs4ksu/kernel_patches/add_susfs_in_kernel-4.19.patch || true
+
+          # Patch KernelSU Next
+          cd KernelSU-Next
+          patch -p1 --forward \
+            < ../susfs4ksu/kernel_patches/add_susfs_in_kernelsu.patch || \
+          patch -p1 --forward \
+            < ../susfs4ksu/kernel_patches/add_susfs_in_gki-android14-6.1.patch || true
+          cd ..
+          echo "[+] SuSFS patched"
+
       - name: Patch KernelSU for this kernel
         run: |
           F=KernelSU-Next/kernel/hook/patch_memory.c
@@ -79,8 +99,17 @@ jobs:
           mkdir -p out
           make O=out A125F_defconfig $FLAGS
           scripts/config --file out/.config \
-            -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS \
-            -e OVERLAY_FS
+            -e KSU \
+            -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS \
+            -e OVERLAY_FS \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOFER \
+            -e KSU_SUSFS_ENABLE_LOG
           make O=out olddefconfig $FLAGS
           make O=out -j$(nproc) $FLAGS 2>&1 | tee build.log
 
@@ -112,7 +141,6 @@ jobs:
                   i += (ln + 3) // 4 * 4
               elif t == 9:
                   break
-
           def top(table):
               best = None
               for (p, n), (o, l) in props.items():
@@ -121,7 +149,6 @@ jobs:
                       if best is None or hz > best[0]:
                           best = (hz, p)
               return best
-
           plan = (("opp_table0", 2500000000, 1281250, "0"),
                   ("opp_table1", 2000000000, 1237500, "1"))
           for table, hz, uv, cl in plan:
@@ -146,16 +173,41 @@ jobs:
           print("Xong")
           EOF
 
+      - name: Pack AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AK3
+          cp out/arch/arm64/boot/Image.gz AK3/
+          cp out/arch/arm64/boot/dts/mediatek/mt6765.dtb AK3/dtb
+          cat > AK3/anykernel.sh << 'EOF'
+          kernel.string=Haruka KSUNext + SuSFS | SM-A125F
+          do.devicecheck=1
+          do.modules=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a12
+          device.name2=a12nsxx
+          device.name3=A125F
+          block=/dev/block/platform/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          EOF
+          cd AK3
+          zip -r9 ../Haruka-KSUNext-SuSFS-A125F.zip . \
+            --exclude=.git --exclude=*.zip
+          echo "[+] AnyKernel3 zip ready"
+
       - name: Upload artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: haruka-a125f-ksunext
+          name: haruka-a125f-ksunext-susfs
           path: |
             out/arch/arm64/boot/Image
             out/arch/arm64/boot/Image.gz
             out/arch/arm64/boot/dts/mediatek/mt6765.dtb
             out/arch/arm64/boot/dts/mediatek/mt6765.stock.dtb
+            Haruka-KSUNext-SuSFS-A125F.zip
             build.log
 
       - name: Release
@@ -168,4 +220,5 @@ jobs:
             out/arch/arm64/boot/Image.gz
             out/arch/arm64/boot/dts/mediatek/mt6765.dtb
             out/arch/arm64/boot/dts/mediatek/mt6765.stock.dtb
+            Haruka-KSUNext-SuSFS-A125F.zip
             build.log
