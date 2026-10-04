@@ -1,0 +1,243 @@
+name: Haruka A125F • KernelSU Next • AnyKernel3
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Kernel config"
+        required: true
+        type: choice
+        default: A125F
+        options:
+          - A125F
+          - DroidSpaces
+      ksu_ref:
+        description: "KernelSU-Next ref (legacy is recommended for this 4.19 tree)"
+        required: true
+        default: legacy
+      make_boot:
+        description: "Build boot.img from a stock boot image"
+        required: true
+        type: boolean
+        default: false
+      stock_boot_url:
+        description: "Direct URL to a STOCK boot.img matching the target firmware (leave empty if not making boot.img)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  KCFLAGS: "-O3 -mcpu=cortex-a53+crypto+crc -ffp-contract=fast -mllvm -enable-epilogue-vectorization -mllvm -polly"
+  KSU_SETUP: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+  AK3_REPO: "https://github.com/osm0sis/AnyKernel3.git"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Haruka kernel
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio flex \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libelf-dev libssl-dev rsync \
+            clang lld llvm python3 unzip zip xz-utils zstd \
+            device-tree-compiler curl git
+
+      - name: Show source information
+        run: |
+          echo "Kernel: $(make -s kernelversion 2>/dev/null || true)"
+          echo "Defconfigs:"
+          ls -l arch/arm64/configs/A125F_defconfig arch/arm64/configs/droidspaces_defconfig
+
+      # KernelSU-Next's official setup script supports selecting the legacy tree
+      # with: setup.sh legacy. The Haruka source already contains the manual
+      # hook call-sites used by its KSU/SUSFS integration.
+      - name: Integrate KernelSU-Next
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: |
+          rm -rf KernelSU KernelSU-Next
+          curl -LSs "$KSU_SETUP" -o /tmp/ksu-setup.sh
+          chmod +x /tmp/ksu-setup.sh
+          bash /tmp/ksu-setup.sh "$KSU_REF"
+
+          test -e drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          test -f drivers/kernelsu/Makefile
+          echo "KernelSU-Next integration:"
+          readlink -f drivers/kernelsu
+
+      - name: Configure kernel
+        run: |
+          rm -rf out
+          mkdir -p out
+
+          if [ "${{ inputs.variant }}" = "DroidSpaces" ]; then
+            make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
+              CC=clang LD=ld.lld \
+              CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+              A125F_defconfig droidspaces_defconfig
+          else
+            make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
+              CC=clang LD=ld.lld \
+              CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+              A125F_defconfig
+          fi
+
+          # Haruka's source already has the KSU call-sites. Enable the
+          # corresponding manual-hook mode and keep the other hook backends off.
+          scripts/config --file out/.config \
+            --enable CONFIG_KSU \
+            --enable CONFIG_KSU_MANUAL_HOOK \
+            --disable CONFIG_KSU_KPROBES_HOOK \
+            --disable CONFIG_KSU_TRACEPOINT_HOOK
+
+          make O=out ARCH="$ARCH" LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            olddefconfig
+
+          echo "---- KSU config ----"
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+
+      - name: Build kernel
+        run: |
+          make -j"$(nproc)" O=out ARCH="$ARCH" \
+            LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            KCFLAGS="$KCFLAGS"
+
+          echo "---- boot outputs ----"
+          find out/arch/arm64/boot -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+
+          test -s out/arch/arm64/boot/Image.lz4
+
+      - name: Prepare AnyKernel3
+        run: |
+          rm -rf AnyKernel3
+          git clone --depth=1 "$AK3_REPO" AnyKernel3
+
+          # A125F is a non-A/B Samsung MT6765 device; use the boot partition
+          # by name and let AK3 preserve the original ramdisk/DTB when needed.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("AnyKernel3/anykernel.sh")
+          s = p.read_text()
+          s = s.replace(
+              "device.name1=maguro",
+              "device.name1=a12"
+          )
+          s = s.replace(
+              "kernel.string=ExampleKernel by osm0sis @ xda-developers",
+              "kernel.string=Haruka A125F KernelSU Next"
+          )
+          s = s.replace(
+              "BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;",
+              "BLOCK=/dev/block/bootdevice/by-name/boot;"
+          )
+          s = s.replace(
+              "block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;",
+              "block=/dev/block/bootdevice/by-name/boot;"
+          )
+          s = s.replace("is_slot_device=1;", "is_slot_device=0;")
+          s = s.replace("IS_SLOT_DEVICE=1;", "IS_SLOT_DEVICE=0;")
+          # Broad compatibility with Samsung recovery environments.
+          s = s.replace("do.devicecheck=1", "do.devicecheck=1")
+          p.write_text(s)
+          PY
+
+          cp out/arch/arm64/boot/Image.lz4 AnyKernel3/
+
+          # Keep a DTB/DTBO only if the kernel build actually generated one.
+          # Otherwise AK3 retains the original image's corresponding component.
+          if [ -s out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+          fi
+          if [ -s out/arch/arm64/boot/dtb.img ]; then
+            cp out/arch/arm64/boot/dtb.img AnyKernel3/
+          fi
+
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+          rm -f AnyKernel3/README.md
+
+          (cd AnyKernel3 && zip -r9 ../Haruka-A125F-KSUNext-AnyKernel3.zip . \
+            -x '*.git*' -x '*.DS_Store')
+
+          test -s Haruka-A125F-KSUNext-AnyKernel3.zip
+
+      - name: Build boot.img from stock boot
+        if: ${{ inputs.make_boot && inputs.stock_boot_url != '' }}
+        run: |
+          mkdir -p bootwork
+          curl -L --fail --retry 3 \
+            "${{ inputs.stock_boot_url }}" \
+            -o bootwork/boot.img
+
+          test -s bootwork/boot.img
+
+          # AnyKernel3 ships magiskboot and understands modern Android boot
+          # formats; for MTK it also contains mkmtkhdr support.
+          cp AnyKernel3/tools/magiskboot bootwork/
+          chmod +x bootwork/magiskboot
+
+          cd bootwork
+          ./magiskboot unpack boot.img
+
+          echo "---- stock boot components ----"
+          ls -lah
+
+          # Haruka's defconfig selects CONFIG_KERNEL_LZ4=y, so the kernel
+          # artifact is Image.lz4.
+          test -s ../out/arch/arm64/boot/Image.lz4
+          cp ../out/arch/arm64/boot/Image.lz4 kernel
+
+          ./magiskboot repack boot.img
+          test -s new-boot.img
+
+          mv new-boot.img ../Haruka-A125F-KSUNext-boot.img
+          cd ..
+
+      - name: Upload kernel + AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haruka-A125F-KSUNext-${{ inputs.variant }}
+          if-no-files-found: error
+          path: |
+            out/arch/arm64/boot/Image.lz4
+            out/.config
+            Haruka-A125F-KSUNext-AnyKernel3.zip
+
+      - name: Upload boot image
+        if: ${{ inputs.make_boot && inputs.stock_boot_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haruka-A125F-KSUNext-boot-${{ inputs.variant }}
+          if-no-files-found: error
+          path: Haruka-A125F-KSUNext-boot.img
+
+      - name: Create checksums
+        run: |
+          sha256sum \
+            out/arch/arm64/boot/Image.lz4 \
+            Haruka-A125F-KSUNext-AnyKernel3.zip \
+            ${BOOT_ARTIFACT:-/dev/null} 2>/dev/null | tee SHA256SUMS.txt || true
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haruka-A125F-KSUNext-SHA256
+          path: SHA256SUMS.txt
